@@ -23,6 +23,16 @@ func openDB() gorm.DB {
 	return db
 }
 
+var dbfCards []DbfCard
+var cardAssetIdToMiniGuid = map[int32]string{}
+
+func init() {
+	db.Find(&dbfCards)
+	for _, dbfCard := range dbfCards {
+		cardAssetIdToMiniGuid[dbfCard.ID] = dbfCard.NoteMiniGuid
+	}
+}
+
 func Migrate() {
 	db.LogMode(true)
 	err := db.AutoMigrate(
@@ -157,6 +167,22 @@ type DbfCardBack struct {
 	Data1    int
 	source   string
 	NameEnus string
+}
+
+type DbfScenario struct {
+	ID                int
+	NoteDesc          string
+	Players           int
+	Player1HeroCardID int
+	Player2HeroCardID int
+	IsTutorial        bool
+	IsExpert          bool
+	AdventureID       int
+	ModeID            int
+	NameEnus          string
+	ShortNameEnus     string
+	DescriptionEnus   string
+	WingID            int
 }
 
 type SeasonProgress struct {

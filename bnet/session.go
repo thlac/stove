@@ -28,6 +28,8 @@ type Session struct {
 	// server.
 	ClientNotifications <-chan *Notification
 
+	notificationHandlers map[string]chan NotifyHandler
+
 	server *Server
 	conn   net.Conn
 
@@ -71,6 +73,7 @@ func NewSession(s *Server, c net.Conn) *Session {
 	sess.packetQueue = make(chan []byte, 1)
 	sess.stateChange = sync.NewCond(&sess.stateMutex)
 	sess.stateListeners = map[int]int32{}
+	sess.notificationHandlers = map[string]chan NotifyHandler{}
 	for i := 0; i < StateCount; i++ {
 		sess.stateListeners[i] = 0
 	}

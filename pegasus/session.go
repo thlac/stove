@@ -63,6 +63,10 @@ func (s *Session) handleNotification(n *bnet.Notification) {
 	switch n.Type {
 	case bnet.NotifyClientRequest:
 		s.HandleUtilRequest(n.Attributes)
+	case bnet.NotifyFindGameRequest:
+		s.HandleFindGame(n.Map())
+	default:
+		log.Panicf("unhandled notification type: %s", n.Type)
 	}
 }
 

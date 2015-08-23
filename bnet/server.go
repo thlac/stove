@@ -66,6 +66,7 @@ func NewServer() *Server {
 	// Client exports:
 	s.registerService(AuthClientServiceBinder{})
 	s.registerService(ChallengeNotifyServiceBinder{})
+	s.registerService(NotificationListenerServiceBinder{})
 
 	return s
 }

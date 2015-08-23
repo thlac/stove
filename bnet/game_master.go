@@ -95,9 +95,32 @@ func (s *GameMasterService) ListFactories(body []byte) ([]byte, error) {
 func (s *GameMasterService) FindGame(body []byte) ([]byte, error) {
 	req := &game_master_service.FindGameRequest{}
 	proto.Unmarshal(body, req)
+	token := s.sess.receivedToken
 	fmt.Println(req.String())
-	// TODO: send notification to game server
-	return nil, nyi
+	advNotification := false
+	if req.AdvancedNotification != nil {
+		advNotification = *req.AdvancedNotification
+	}
+	player := req.Player[0]
+	notify := NewNotification(NotifyFindGameRequest, map[string]interface{}{
+		"advanced_notification": advNotification,
+	})
+	// TODO: care about game_properties and other stuff
+	notify.Attributes = append(notify.Attributes, player.Attribute...)
+	s.sess.OnceNotified(NotifyFindGameResponse, func(n *Notification) {
+		m := n.Map()
+		res := &game_master_service.FindGameResponse{}
+		res.Queued = proto.Bool(m["queued"].(bool))
+		res.RequestId = proto.Uint64(m["requestId"].(uint64))
+		res.FactoryId = proto.Uint64(0)
+		buf, err := proto.Marshal(res)
+		if err != nil {
+			panic(err)
+		}
+		s.sess.Respond(token, buf)
+	})
+	s.sess.ServerNotifications <- notify
+	return nil, nil
 }
 
 func (s *GameMasterService) CancelGameEntry(body []byte) error {

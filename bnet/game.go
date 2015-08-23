@@ -75,10 +75,6 @@ func (s *GameUtilitiesService) ProcessClientRequest(body []byte) ([]byte, error)
 	}
 	log.Printf("req = %s", req.String())
 	token := s.sess.receivedToken
-	s.sess.ServerNotifications <- &Notification{
-		NotifyClientRequest,
-		req.Attribute,
-	}
 	s.sess.OnceNotified(NotifyClientResponse, func(n *Notification) {
 		log.Printf("received client response notification")
 		if len(n.Attributes) < 2 {
@@ -93,6 +89,10 @@ func (s *GameUtilitiesService) ProcessClientRequest(body []byte) ([]byte, error)
 		}
 		s.sess.Respond(token, buf)
 	})
+	s.sess.ServerNotifications <- &Notification{
+		NotifyClientRequest,
+		req.Attribute,
+	}
 	return nil, nil
 }
 

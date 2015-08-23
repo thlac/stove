@@ -3,6 +3,7 @@ package bnet
 import (
 	"github.com/HearthSim/hs-proto-go/bnet/attribute"
 	"github.com/HearthSim/hs-proto-go/bnet/entity"
+	"github.com/HearthSim/hs-proto-go/bnet/notification_service"
 	"github.com/golang/protobuf/proto"
 	"log"
 )
@@ -120,6 +121,7 @@ func (n *Notification) Map() map[string]interface{} {
 }
 
 func (s *Session) HandleNotifications() {
+	s.DisconnectOnPanic()
 	quit := s.ChanForTransition(StateDisconnected)
 	for {
 		select {
@@ -135,24 +137,91 @@ func (s *Session) handleNotification(notify *Notification) {
 	log.Printf("received notification (%s): %v\n", notify.Type, notify.Attributes)
 	switch notify.Type {
 	default:
-		if ch, ok := notificationHandlers[notify.Type]; ok {
-			(<-ch)(notify)
+		if ch, ok := s.notificationHandlers[notify.Type]; ok {
+			h := <-ch
+			h(notify)
+			return
+		}
+
+		forwardToClient := false
+		var targetId, senderId *entity.EntityId
+		filteredAttr := []*attribute.Attribute{}
+		for _, attr := range notify.Attributes {
+			switch *attr.Name {
+			case "forwardToClient":
+				forwardToClient = *attr.Value.BoolValue
+			case "targetId":
+				targetId = attr.Value.EntityidValue
+			case "senderId":
+				senderId = attr.Value.EntityidValue
+			default:
+				filteredAttr = append(filteredAttr, attr)
+			}
+		}
+		if forwardToClient {
+			notifier := s.ImportedService("bnet.protocol.notification.NotificationListener").(*NotificationListenerService)
+			notifier.Notify(&notification_service.Notification{
+				Type:      proto.String(notify.Type),
+				SenderId:  senderId,
+				TargetId:  targetId,
+				Attribute: filteredAttr,
+			})
 			return
 		}
 		log.Panicf("error: unhandled notification type %s", notify.Type)
 	}
 }
 
-var notificationHandlers = map[string]chan func(*Notification){}
+type NotifyHandler func(n *Notification)
 
 // Will trigger handler once the server is notified with a notification of type
 // ty.
-func (s *Session) OnceNotified(ty string, handle func(n *Notification)) {
-	if ch, ok := notificationHandlers[ty]; ok {
+func (s *Session) OnceNotified(ty string, handle NotifyHandler) {
+	log.Printf("Adding OnceNotified for type=%s\n", ty)
+	if ch, ok := s.notificationHandlers[ty]; ok {
 		ch <- handle
 	} else {
-		ch = make(chan func(*Notification), 1)
-		notificationHandlers[ty] = ch
+		ch = make(chan NotifyHandler, 1)
+		s.notificationHandlers[ty] = ch
 		ch <- handle
+	}
+}
+
+type NotificationListenerServiceBinder struct{}
+
+func (NotificationListenerServiceBinder) Bind(sess *Session) Service {
+	return &NotificationListenerService{sess}
+}
+
+// The NotificationListener service sends notifications to the client.
+type NotificationListenerService struct {
+	sess *Session
+}
+
+func (s *NotificationListenerService) Name() string {
+	return "bnet.protocol.notification.NotificationListener"
+}
+
+func (s *NotificationListenerService) Methods() []string {
+	return []string{
+		"",
+		"OnNotificationReceived",
+	}
+}
+
+func (s *NotificationListenerService) Invoke(method int, body []byte) (resp []byte, err error) {
+	log.Panicf("NotificationListener is a client export, not a server export")
+	return
+}
+
+func (s *NotificationListenerService) Notify(n *notification_service.Notification) {
+	buf, err := proto.Marshal(n)
+	if err != nil {
+		panic(err)
+	}
+	header := s.sess.MakeRequestHeader(s, 1, len(buf))
+	err = s.sess.QueuePacket(header, buf)
+	if err != nil {
+		panic(err)
 	}
 }

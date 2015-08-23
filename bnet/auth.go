@@ -129,7 +129,7 @@ func (s *AuthServerService) CompleteLogin() error {
 		res.ErrorCode = proto.Uint32(ErrorOK)
 		res.Account = EntityId(0, 1)
 		res.GameAccount = make([]*entity.EntityId, 1)
-		res.GameAccount[0] = EntityId(1, 1)
+		res.GameAccount[0] = EntityId(144115193835963207, 23658506)
 		res.ConnectedRegion = proto.Uint32(0x5553) // 'US'
 
 		if s.program == "WTCG" {
