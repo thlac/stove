@@ -77,7 +77,7 @@ def main():
 
 	for path in files:
 		tablename = os.path.splitext(path)[0].lower()
-		with open(os.path.join(datadir, "DBF", path), "r") as f:
+		with open(os.path.join(datadir, "DBF", path), "r", encoding="utf-8") as f:
 			xml = ElementTree.parse(f)
 
 			cols = [(e.attrib["name"], e.attrib["type"]) for e in xml.findall("Column")]
@@ -109,7 +109,7 @@ def main():
 	cur.execute("SELECT id, note_mini_guid FROM dbf_card")
 	rows = cur.fetchall()
 
-	with open(os.path.join(datadir, "CardDefs.xml"), "r") as f:
+	with open(os.path.join(datadir, "CardDefs.xml"), "r", encoding="utf-8") as f:
 		xml = ElementTree.parse(f)
 
 		for pk, id in rows:
