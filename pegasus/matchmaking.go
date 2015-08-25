@@ -21,8 +21,8 @@ func (s *Session) HandleFindGame(req map[string]interface{}) {
 	aiDeckID := 1
 	if scenario.Players == 1 {
 		game := NewGame(s, nil,
-			int(deckID), aiDeckID,
-			int(deck.HeroID), scenario.Player2HeroCardID,
+			[2]int{int(deckID), aiDeckID},
+			[2]int{int(deck.HeroID), scenario.Player2HeroCardID},
 			true)
 		go game.Run()
 	} else {

@@ -3,6 +3,7 @@ package bnet
 import (
 	"fmt"
 	"github.com/HearthSim/hs-proto-go/bnet/game_master_service"
+	"github.com/HearthSim/hs-proto-go/bnet/game_master_types"
 	"github.com/golang/protobuf/proto"
 	"log"
 )
@@ -124,7 +125,10 @@ func (s *GameMasterService) FindGame(body []byte) ([]byte, error) {
 }
 
 func (s *GameMasterService) CancelGameEntry(body []byte) error {
-	return nyi
+	req := &game_master_types.CancelGameEntryRequest{}
+	proto.Unmarshal(body, req)
+	fmt.Printf("req = %s\n", req.String())
+	return nil
 }
 
 func (s *GameMasterService) GameEnded(body []byte) error {

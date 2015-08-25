@@ -11,6 +11,7 @@ import (
 	"github.com/HearthSim/hs-proto-go/pegasus/shared"
 	"github.com/HearthSim/stove/bnet"
 	"github.com/golang/protobuf/proto"
+	"io"
 	"log"
 	"net"
 	"runtime/debug"
@@ -21,39 +22,47 @@ import (
 type Game struct {
 	sync.Mutex
 
-	Player1     *Session
-	Player1Deck Deck
-	Player1Hero DbfCard
+	Players []*GamePlayer
 
-	Player2     *Session
-	Player2Deck Deck
-	Player2Hero DbfCard
-
-	IsAIGame bool
-	Address  net.TCPAddr
+	HasBeenSetup bool
+	IsAIGame     bool
+	Address      net.TCPAddr
 
 	Passwords map[string]*Session
 
-	quit       chan struct{}
-	sock       net.Listener
-	kettleConn net.Conn
-	clients    []*GameClient
-	history    []*game.PowerHistoryData
+	quit        chan struct{}
+	sock        net.Listener
+	kettleConn  net.Conn
+	kettleWrite chan []byte
+	clients     []*GameClient
+	history     []*game.PowerHistoryData
+}
+
+type GamePlayer struct {
+	s        *Session
+	Name     string
+	Deck     Deck
+	Hero     DbfCard
+	Password string
 }
 
 func NewGame(player1, player2 *Session,
-	player1DeckID, player2DeckID int,
-	player1HeroCardID, player2HeroCardID int,
+	playerDeckIds [2]int, playerHeroCardIds [2]int,
 	isAIGame bool) *Game {
 
 	res := &Game{}
-	db.Preload("Cards").First(&res.Player1Deck, player1DeckID)
-	db.Preload("Cards").First(&res.Player2Deck, player2DeckID)
-	db.First(&res.Player1Hero, player1HeroCardID)
-	db.First(&res.Player2Hero, player2HeroCardID)
+	res.Players = make([]*GamePlayer, 2)
+	for i := 0; i < 2; i++ {
+		res.Players[i] = &GamePlayer{}
+		p := res.Players[i]
+		db.Preload("Cards").First(&p.Deck, playerDeckIds[i])
+		db.First(&p.Hero, playerHeroCardIds[i])
+	}
 
-	res.Player1 = player1
-	res.Player2 = player2
+	res.Players[0].s = player1
+	res.Players[1].s = player2
+	res.Players[0].Name = "Player1"
+	res.Players[1].Name = "Player2"
 	res.IsAIGame = isAIGame
 
 	res.Passwords = map[string]*Session{}
@@ -66,6 +75,7 @@ func (g *Game) Close() {
 	for _, c := range g.clients {
 		c.Disconnect()
 	}
+	g.kettleConn.Close()
 	g.Lock()
 	defer g.Unlock()
 	select {
@@ -106,14 +116,17 @@ func (g *Game) Run() {
 	go g.Listen()
 	g.Address = *(sock.Addr().(*net.TCPAddr))
 
-	player1Password := GenPassword()
-	g.Passwords[player1Password] = g.Player1
+	for _, p := range g.Players {
+		password := GenPassword()
+		g.Passwords[password] = p.s
+		p.Password = password
+	}
 
 	connectInfo := &game_master_types.ConnectInfo{}
 	// TODO: figure out the right host
 	connectInfo.Host = proto.String("127.0.0.1")
 	connectInfo.Port = proto.Int32(int32(g.Address.Port))
-	connectInfo.Token = []byte(player1Password)
+	connectInfo.Token = []byte(g.Players[0].Password)
 	connectInfo.MemberId = &entity.EntityId{}
 	connectInfo.MemberId.High = proto.Uint64(0)
 	connectInfo.MemberId.Low = proto.Uint64(0)
@@ -129,7 +142,7 @@ func (g *Game) Run() {
 	if err != nil {
 		panic(err)
 	}
-	g.Player1.gameNotifications <- bnet.NewNotification(bnet.NotifyQueueResult, map[string]interface{}{
+	g.Players[0].s.gameNotifications <- bnet.NewNotification(bnet.NotifyQueueResult, map[string]interface{}{
 		"connection_info": bnet.MessageValue{buf},
 		"targetId":        *bnet.EntityId(0, 0),
 		"forwardToClient": true,
@@ -145,63 +158,26 @@ func (g *Game) Run() {
 	}
 	g.kettleConn = kettle
 
-	init := KettleCreateGame{}
-	player1Cards := []string{}
-	for _, card := range g.Player1Deck.Cards {
-		//for i := 0; i < card.Num; i++ {
-		player1Cards = append(player1Cards, cardAssetIdToMiniGuid[card.CardID])
-		//}
-	}
-	init.Players = append(init.Players, KettleCreatePlayer{
-		Hero:  g.Player1Hero.NoteMiniGuid,
-		Cards: player1Cards,
-		Name:  "TestPlayer1",
-	})
-	player2Cards := []string{}
-	for _, card := range g.Player2Deck.Cards {
-		//for i := 0; i < card.Num; i++ {
-		player2Cards = append(player2Cards, cardAssetIdToMiniGuid[card.CardID])
-		//}
-	}
-	init.Players = append(init.Players, KettleCreatePlayer{
-		Hero:  g.Player2Hero.NoteMiniGuid,
-		Cards: player1Cards,
-		Name:  "TestPlayer2",
-	})
-	init.GameID = "testing"
-	initBuf, err := json.Marshal([]KettlePacket{{Type: "CreateGame", CreateGame: &init}})
 	lenBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(lenBuf, uint32(len(initBuf)))
-	if err != nil {
-		panic(err)
-	}
-	written, err := kettle.Write(append(lenBuf, initBuf...))
-	if err != nil {
-		panic(err)
-	}
-	log.Printf("wrote %d bytes to kettle: %s\n", written, string(initBuf))
+	g.kettleWrite = make(chan []byte, 1)
+	go g.WriteKettle()
+	g.InitKettle()
 	for {
-		for lenRead := 0; lenRead < 4; {
-			read, err := kettle.Read(lenBuf[lenRead:])
-			lenRead += read
-			if err != nil {
-				panic(err)
-			}
+		_, err := io.ReadFull(kettle, lenBuf)
+		if err != nil {
+			panic(err)
 		}
 		plen := int(binary.LittleEndian.Uint32(lenBuf))
 		packetBuf := make([]byte, plen)
-		for packRead := 0; packRead < plen; {
-			read, err := kettle.Read(packetBuf[packRead:])
-			packRead += read
-			if err != nil {
-				panic(err)
-			}
+		_, err = io.ReadFull(kettle, packetBuf)
+		if err != nil {
+			panic(err)
 		}
-		log.Printf("received %d bytes from kettle: %s...\n", len(packetBuf), string(packetBuf))
+
+		log.Printf("received %d bytes from kettle: %s\n", len(packetBuf), string(packetBuf))
 		packets := []KettlePacket{}
 		json.Unmarshal(packetBuf, &packets)
 		createGame := g.history[0].CreateGame
-		playerId := 1
 		for _, packet := range packets {
 			switch packet.Type {
 			case "GameEntity":
@@ -215,7 +191,7 @@ func (g *Game) Run() {
 				packet.Player.Tags["30"] = packet.Player.EntityID - 1
 				player.Entity = packet.Player.ToProto()
 				player.CardBack = proto.Int32(26)
-				if playerId == 1 {
+				if len(createGame.Players) == 0 {
 					player.GameAccountId = &shared.BnetId{
 						Hi: proto.Uint64(144115193835963207),
 						Lo: proto.Uint64(23658506),
@@ -226,7 +202,6 @@ func (g *Game) Run() {
 						Lo: proto.Uint64(5678),
 					}
 				}
-				playerId++
 				createGame.Players = append(createGame.Players, player)
 			case "TagChange":
 				log.Printf("got a %s!\n", packet.Type)
@@ -243,6 +218,15 @@ func (g *Game) Run() {
 			case "FullEntity":
 				full := &game.PowerHistoryEntity{}
 				packet.FullEntity.Tags["53"] = packet.FullEntity.EntityID
+				if !g.HasBeenSetup {
+					for _, p := range packets {
+						if p.Type == "TagChange" &&
+							p.TagChange.EntityID == packet.FullEntity.EntityID &&
+							p.TagChange.Tag == 49 {
+							packet.FullEntity.Tags["49"] = p.TagChange.Value
+						}
+					}
+				}
 				e := packet.FullEntity.ToProto()
 				full.Entity = e.Id
 				full.Tags = e.Tags
@@ -259,10 +243,21 @@ func (g *Game) Run() {
 				log.Printf("got a %s!\n", packet.Type)
 			case "Choices":
 				log.Printf("got a %s!\n", packet.Type)
+			case "Options":
+				log.Printf("got a %s!\n", packet.Type)
+				options := &game.AllOptions{}
+				options.Id = proto.Int32(1)
+				for _, o := range packet.Options {
+					options.Options = append(options.Options, o.ToProto())
+				}
+				for _, c := range g.clients {
+					c.packetQueue <- EncodePacket(game.AllOptions_ID, options)
+				}
 			default:
 				log.Panicf("unknown Kettle packet type: %s", packet.Type)
 			}
 		}
+		g.HasBeenSetup = true
 		for _, c := range g.clients {
 			if c.hasHistoryTo < len(g.history) {
 				c.packetQueue <- EncodePacket(game.PowerHistory_ID, &game.PowerHistory{
@@ -274,8 +269,53 @@ func (g *Game) Run() {
 	}
 }
 
+func (g *Game) InitKettle() {
+	init := KettleCreateGame{}
+	for _, player := range g.Players {
+		playerCards := []string{}
+		for _, card := range player.Deck.Cards {
+			//for i := 0; i < card.Num; i++ {
+			playerCards = append(playerCards, cardAssetIdToMiniGuid[card.CardID])
+			//}
+		}
+		init.Players = append(init.Players, KettleCreatePlayer{
+			Hero:  player.Hero.NoteMiniGuid,
+			Cards: playerCards,
+			Name:  player.Name,
+		})
+	}
+	initBuf, err := json.Marshal([]KettlePacket{{
+		Type:       "CreateGame",
+		GameID:     "testing",
+		CreateGame: &init,
+	}})
+	if err != nil {
+		panic(err)
+	}
+	g.kettleWrite <- initBuf
+}
+
+func (g *Game) WriteKettle() {
+	defer g.CloseOnError()
+	for {
+		select {
+		case buf := <-g.kettleWrite:
+			lenBuf := make([]byte, 4)
+			binary.LittleEndian.PutUint32(lenBuf, uint32(len(buf)))
+			written, err := g.kettleConn.Write(append(lenBuf, buf...))
+			if err != nil {
+				panic(err)
+			}
+			log.Printf("wrote %d bytes to kettle: %s\n", written, string(buf))
+		case <-g.quit:
+			return
+		}
+	}
+}
+
 type KettlePacket struct {
 	Type        string
+	GameID      string
 	CreateGame  *KettleCreateGame  `json:",omitempty"`
 	GameEntity  *KettleEntity      `json:",omitempty"`
 	Player      *KettlePlayer      `json:",omitempty"`
@@ -286,10 +326,10 @@ type KettlePacket struct {
 	HideEntity  *KettleFullEntity  `json:",omitempty"`
 	MetaData    *KettleMetaData    `json:",omitempty"`
 	Choices     *KettleChoices     `json:",omitempty"`
+	Options     []*KettleOption    `json:",omitempty"`
 }
 
 type KettleCreateGame struct {
-	GameID  string
 	Players []KettleCreatePlayer
 }
 
@@ -301,6 +341,19 @@ type KettleCreatePlayer struct {
 
 type GameTags map[string]int
 
+func TagsToProto(tags GameTags) []*game.Tag {
+	res := []*game.Tag{}
+	for name, value := range tags {
+		nameI, err := strconv.Atoi(name)
+		if err != nil {
+			panic(err)
+		}
+		t := MakeTag(nameI, value)
+		res = append(res, t)
+	}
+	return res
+}
+
 type KettleEntity struct {
 	EntityID int
 	Tags     GameTags
@@ -309,14 +362,7 @@ type KettleEntity struct {
 func (e *KettleEntity) ToProto() *game.Entity {
 	res := &game.Entity{}
 	res.Id = proto.Int32(int32(e.EntityID))
-	for name, value := range e.Tags {
-		nameI, err := strconv.Atoi(name)
-		if err != nil {
-			panic(err)
-		}
-		t := MakeTag(nameI, value)
-		res.Tags = append(res.Tags, t)
-	}
+	res.Tags = TagsToProto(e.Tags)
 	return res
 }
 
@@ -368,6 +414,39 @@ type KettleChoices struct {
 	Choices  []int
 }
 
+type KettleOption struct {
+	Type       int
+	MainOption *KettleSubOption   `json:",omitempty"`
+	SubOptions []*KettleSubOption `json:",omitempty"`
+}
+
+type KettleSubOption struct {
+	ID      int
+	Targets []int `json:",omitempty"`
+}
+
+func (o *KettleOption) ToProto() *game.Option {
+	res := &game.Option{}
+	var x = game.Option_Type(o.Type)
+	res.Type = &x
+	if o.MainOption != nil {
+		res.MainOption = o.MainOption.ToProto()
+	}
+	for _, s := range o.SubOptions {
+		res.SubOptions = append(res.SubOptions, s.ToProto())
+	}
+	return res
+}
+
+func (s *KettleSubOption) ToProto() *game.SubOption {
+	res := &game.SubOption{}
+	res.Id = proto.Int32(int32(s.ID))
+	for _, t := range s.Targets {
+		res.Targets = append(res.Targets, int32(t))
+	}
+	return res
+}
+
 type GameClient struct {
 	sync.Mutex
 	g            *Game
@@ -415,6 +494,9 @@ func (c *GameClient) DisconnectOnError() {
 		log.Printf("game session error: %v\n=== STACK TRACE ===\n%s",
 			err, string(debug.Stack()))
 		c.Disconnect()
+		if c.s != nil {
+			c.g.Close()
+		}
 	}
 }
 
@@ -476,6 +558,8 @@ func init() {
 	OnGamePacket(bobnet.AuroraHandshake_ID, (*GameClient).OnAuroraHandshake)
 	OnGamePacket(bobnet.Ping_ID, (*GameClient).OnPing)
 	OnGamePacket(game.GetGameState_ID, (*GameClient).OnGetGameState)
+	OnGamePacket(game.ChooseOption_ID, (*GameClient).OnChooseOption)
+	OnGamePacket(game.UserUI_ID, (*GameClient).OnUserUI)
 }
 
 func (c *GameClient) HandlePacket(p *Packet) {
@@ -496,11 +580,11 @@ func (c *GameClient) OnAuroraHandshake(body []byte) {
 	log.Printf("AuroraHandshake = %s", req.String())
 	if sess, ok := c.g.Passwords[*req.Password]; ok {
 		c.s = sess
-		switch {
-		case c.s == c.g.Player1:
-			c.PlayerID = 1
-		case c.s == c.g.Player2:
-			c.PlayerID = 2
+		for i, p := range c.g.Players {
+			if p.s == c.s {
+				c.PlayerID = i + 1
+				break
+			}
 		}
 	} else {
 		panic("bad password")
@@ -518,5 +602,16 @@ func (c *GameClient) OnPing(body []byte) {
 	c.packetQueue <- EncodePacket(bobnet.Pong_ID, &bobnet.Pong{})
 }
 
-func (c *GameClient) OnGetGameState(body []byte) {
+func (c *GameClient) OnGetGameState(body []byte) {}
+
+func (c *GameClient) OnChooseOption(body []byte) {
+	req := &game.ChooseOption{}
+	proto.Unmarshal(body, req)
+	log.Printf("ChooseOption = %s\n", req.String())
+}
+
+func (c *GameClient) OnUserUI(body []byte) {
+	req := &game.UserUI{}
+	proto.Unmarshal(body, req)
+	log.Printf("UserUI = %s\n", req.String())
 }
